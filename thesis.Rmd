@@ -1,0 +1,1472 @@
+---
+title: "thesis"
+output: html_document
+date: "2023-05-24"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load library
+
+```{r}
+library(stargazer)
+library(ggplot2)
+library(lubridate)
+library(tidyverse)
+library(dplyr)
+library(DescTools)
+library(statar)
+library("tidymodels")
+library("doParallel")
+library("themis")
+library("xgboost")
+library(GGally)
+library(mlbench)
+library(yardstick)
+library(yardstick)
+library(zoo)
+library(forecast)
+library(fable)
+library(bayesforecast)
+library(tseries)
+library(caret)
+library(groupdata2)
+library(pdp)
+```
+
+## Read data
+
+```{r}
+thesis <- read.csv('master_thesis.csv',sep=',')
+
+```
+
+# Data Cleaning
+
+```{r}
+thesis <- na.omit(thesis)
+thesis <- thesis[!duplicated(thesis), ]
+```
+
+Check data type
+
+```{r}
+str(thesis)
+unique(thesis$Location)
+```
+
+find missing dates
+
+```{r}
+all_dates <- seq(as.Date("2019-01-01"), as.Date("2019-12-31"), by = "1 day")
+existing_dates <- as.Date(thesis$day)
+missing_dates <- all_dates[!all_dates %in% existing_dates]
+missing_dates
+```
+
+outliers check
+
+```{r}
+class(thesis)
+```
+
+```{r}
+ggplot(thesis, aes(ChargeTime)) +geom_histogram() + 
+  geom_density(aes(y=1*..count..), colour="blue", adjust=3) +
+  labs(x = "ChargeTime", y = "Value")
+ggplot(thesis, aes(ConnectedTime)) +geom_histogram() + 
+  geom_density(aes(y=5*..count..), colour="blue", adjust=3)+
+  labs(x = "ConnectedTime", y = "Value")
+ggplot(thesis, aes(TotalEnergy)) +geom_histogram() + 
+  geom_density(aes(y=5.5*..count..), colour="blue", adjust=3) +
+  labs(x = "TotalEnergy", y = "Value")
+ggplot(thesis, aes(MaxPower)) +geom_histogram() + 
+  geom_density(aes(y=1.8*..count..), colour="blue", adjust=3)
+```
+
+```{r}
+boxplot(thesis$ChargeTime)
+boxplot(thesis$ConnectedTime)
+```
+
+```{r}
+# Calculate Tukey's fences
+stats <- boxplot.stats(thesis$ConnectedTime)
+lower_fence <- stats$stats[1] - 1.5 * IQR(thesis$ChargeTime)
+upper_fence <- stats$stats[5] + 1.5 * IQR(thesis$ChargeTime)
+
+# Identify outliers
+outliers <- thesis$ChargeTime < lower_fence | thesis$ChargeTime > upper_fence
+outlier_values <- thesis$ChargeTime[outliers]
+print(outlier_values)
+```
+
+```{r}
+filtered_sessions <- thesis[thesis$ConnectedTime > 24, ]
+line_graph <- ggplot(filtered_sessions) +
+  geom_line(aes(x = TransactionId, y = ChargeTime, color = "Charge Time")) +
+  geom_line(aes(x = TransactionId, y = ConnectedTime, color = "Connected Time")) +
+  geom_line(aes(x = TransactionId, y = TotalEnergy, color = "Total Energy")) +
+  labs(x = "Session", y = "Value") +
+  ggtitle("Line Graph: Charge Time, Connected Time, and Total Energy") +
+  scale_color_manual(values = c("Charge Time" = "blue", "Connected Time" = "red", "Total Energy" = "green"))
+line_graph
+```
+
+remove charge time \> connected time
+
+```{r}
+thesis <- thesis %>%
+  filter(ChargeTime <= ConnectedTime)
+
+```
+
+Remove data that chargetime \<30 mins and total energy \<1 kwh
+
+```{r}
+thesis <- subset(thesis, ChargeTime > 0.5 | TotalEnergy >=1)
+```
+
+### Summary Statistics - clean
+
+```{r}
+stargazer(thesis)
+```
+
+# Feature engineering
+
+```{r}
+#Month
+thesis$Month <- month(thesis$UTCTransactionStart)
+
+#Season
+thesis$Season <- case_when(
+  thesis$Month %in% c("12", "1", "2") ~ "Winter",
+  thesis$Month %in% c("3", "4", "5") ~ "Spring",
+  thesis$Month %in% c("6", "7", "8") ~ "Summer",
+  thesis$Month %in% c("9", "10", "11") ~ "Fall")
+
+#Holiday
+holiday_days <- c(ymd("2019-01-01"), ymd("2019-04-21"), ymd("2019-04-22"), ymd("2019-04-27"), ymd("2019-05-30"), ymd("2019-06-09"), ymd("2019-06-10"), ymd("2019-12-25"), ymd("2019-12-26"))
+thesis$day <- as.Date(thesis$UTCTransactionStart)
+thesis <- thesis %>%
+  mutate(holiday = day %in% holiday_days)
+thesis <- thesis %>%
+  mutate(holiday = ifelse(holiday, 1, 0))
+
+#Start time
+thesis$UTCTransactionStart <- as.POSIXct(thesis$UTCTransactionStart)
+thesis$PluginHour <- as.numeric(format(thesis$UTCTransactionStart, "%H"))
+
+#end time
+thesis$UTCTransactionStop <- as.POSIXct(thesis$UTCTransactionStop)
+thesis$ChargingHour_end <- as.numeric(format(thesis$UTCTransactionStop, "%H"))
+
+#day of week
+thesis$Day_of_week <- as.numeric(format(thesis$UTCTransactionStart, "%u"))
+#idle time
+thesis$IdleTime <- thesis$ConnectedTime - thesis$ChargeTime
+```
+
+```{r}
+filtered_idle <- thesis[thesis$IdleTime > 24, ]
+line_graph <- ggplot(filtered_idle) +
+  geom_line(aes(x = TransactionId, y = ChargeTime, color = "Charge Time")) +
+  geom_line(aes(x = TransactionId, y = ConnectedTime, color = "Connected Time")) +
+  geom_line(aes(x = TransactionId, y = TotalEnergy, color = "Total Energy")) +
+  labs(x = "Session", y = "Value") +
+  ggtitle("Line Graph: Charge Time, Connected Time, and Total Energy") +
+  scale_color_manual(values = c("Charge Time" = "blue", "Connected Time" = "red", "Total Energy" = "green"))
+line_graph
+```
+
+```{r}
+thesis$ChargingHour_start <- thesis$PluginHour + thesis$IdleTime
+thesis$ChargingHour_start <- floor(thesis$ChargingHour_start)
+thesis$ChargingHour_start <- thesis$ChargingHour_start %% 24
+```
+
+```{r}
+line_graph <- ggplot(thesis) +
+  geom_line(aes(x = TransactionId, y = PluginHour, color = "Plug In Time")) +
+  geom_line(aes(x = TransactionId, y = ChargingHour_start, color = "Charge Time")) +
+  geom_line(aes(x = TransactionId, y = TotalEnergy, color = "Total Energy")) +
+  labs(x = "Session", y = "Value") +
+  ggtitle("Line Graph: Charge Time, Connected Time, and Total Energy") +
+  scale_color_manual(values = c("Charge Time" = "blue", "Connected Time" = "red", "Total Energy" = "green"))
+line_graph
+```
+
+## Sort in chronological order
+
+```{r}
+thesis <- thesis %>%
+  arrange(UTCTransactionStart)
+```
+
+# Exploratory analysis
+
+```{r}
+monthly_energy <- thesis %>%
+  group_by(Month) %>%
+  summarize(total_energy = sum(TotalEnergy))
+ggplot(monthly_energy, aes(x = Month, y = total_energy)) +
+  geom_line() +
+  labs(x = "Month", y = "Total Energy")+
+  scale_x_continuous(breaks = 1:12, minor_breaks = NULL)
+```
+
+```{r}
+monthly_energy_by_location <- thesis %>%
+  group_by(Location, Month) %>%
+  summarize(total_energy = sum(TotalEnergy))
+ggplot(monthly_energy_by_location, aes(x = Month, y = total_energy, color = Location)) +
+  geom_line() +
+  labs(x = "Month", y = "Total Energy", color = "Location")+
+  scale_x_continuous(breaks = 1:12, minor_breaks = NULL)
+```
+
+```{r}
+sessions_by_location <- thesis %>%
+  group_by(Location, Month) %>%
+  summarize(num_sessions = n())
+ggplot(sessions_by_location, aes(x = Location, y = num_sessions, fill = Month)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = "Location", y = "Number of Charging Sessions", fill = "Month")
+
+```
+
+```{r}
+season_energy <- thesis %>%
+  group_by(Season) %>%
+  summarize(total_session = sum(TransactionId))
+ggplot(season_energy, aes(x = Season, y = total_session)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Season", y = "Charging sessions")
+```
+
+```{r}
+day_energy <- thesis %>%
+  group_by(day) %>%
+  summarize(total_energy = sum(TotalEnergy))
+ggplot(day_energy, aes(x = day, y = total_energy)) +
+  geom_line() +
+  labs(x = "Day", y = "Charging Energy")
+```
+
+```{r}
+hour_energy <- thesis %>%
+  group_by(ChargingHour_start) %>%
+  summarize(total_energy = sum(TotalEnergy))
+ggplot(hour_energy, aes(x = ChargingHour_start, y = total_energy)) +
+  geom_line() +
+  labs(x = "Hour", y = "Charging Energy")
+```
+
+```{r}
+hour_session_start <- thesis %>%
+  group_by(ChargingHour_start) %>%
+  summarize(total_session = sum(TransactionId))
+  
+hour_session_plugin <- thesis %>%
+  group_by(PluginHour) %>%
+  summarize(total_session = sum(TransactionId))
+
+hour_session_end <- thesis %>%
+  group_by(ChargingHour_end) %>%
+  summarize(total_session = sum(TransactionId))
+
+ggplot() +
+  geom_line(data = hour_session_start, aes(x = ChargingHour_start, y = total_session, color = "Charging Start")) +
+  geom_line(data = hour_session_plugin, aes(x = PluginHour, y = total_session, color = "Plugin Time")) +
+  geom_line(data = hour_session_end, aes(x = ChargingHour_end, y = total_session, color = "Charging End")) +
+  labs(x = "Hour", y = "Charging Session") +
+  scale_color_manual(values = c("Charging Start" = "blue", "Plugin Time" = "Orange", "Charging End" = "black")) +
+  ggtitle("Charging Session by Hour - Charging Start vs Plugin Time vs Charging End")
+```
+
+```{r}
+day_session <- thesis %>%
+  group_by(Day_of_week) %>%
+  summarize(total_session = sum(TransactionId))
+ggplot(day_session, aes(x = Day_of_week, y = total_session)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Day", y = "Charging Session") + scale_x_continuous(
+    breaks = 1:7,
+    labels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+  )
+```
+
+```{r}
+season_session <- thesis %>%
+  group_by(Season) %>%
+  summarize(total_session = sum(TransactionId))
+ggplot(season_session, aes(x = Season, y = total_session)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Season", y = "Charging Session") 
+```
+
+```{r}
+monthly_session_by_location <- thesis %>%
+  group_by(Location, Month) %>%
+  summarize(total_session = sum(TransactionId))
+ggplot(monthly_session_by_location, aes(x = Month, y = total_session, color = Location)) +
+  geom_line() +
+  labs(x = "Month", y = "Total Sessions", color = "Location")+
+  scale_x_continuous(breaks = 1:12, minor_breaks = NULL)
+```
+
+``` {[';'r}
+ggplot(thesis, aes(x=TotalEnergy)) +geom_histogram(binwidth = 5)
+month_idle <- thesis %>%
+  group_by(Month) %>%
+  summarize(total_idle = sum(IdleTime))
+```
+
+```{r}
+ggplot(month_idle, aes(x = Month, y = total_idle)) +
+  geom_line() +
+  labs(x = "Month", y = "Idle Time")+
+  scale_x_continuous(breaks = 1:12, minor_breaks = NULL)
+```
+
+# ARIMA-based model
+
+## SARIMAX with location
+
+### Data every 4hr
+
+```{r}
+model_data <- thesis %>%
+  mutate(UTCTransactionStart = ymd_hms(UTCTransactionStart)) %>%
+  mutate(Interval = floor_date(UTCTransactionStart, "4 hours")) %>%
+  group_by(Date = as.Date(Interval), Interval, Location) %>%
+  summarize(daily_total_energy = sum(TotalEnergy),
+            avg_chargetime = mean(ChargeTime), 
+            avg_max_power = mean(MaxPower),
+            avg_start_time = mean(ChargingHour_start),
+            avg_end_time = mean(ChargingHour_end),
+            avg_plugin_time = mean(PluginHour),
+            avg_idle_time = mean(IdleTime))
+
+model_data$month <- month(model_data$Date)
+
+model_data$season <- case_when(
+  model_data$month %in% c("12", "1", "2") ~ "Winter",
+  model_data$month %in% c("3", "4", "5") ~ "Spring",
+  model_data$month %in% c("6", "7", "8") ~ "Summer",
+  model_data$month %in% c("9", "10", "11") ~ "Fall")
+model_data$season <- as.numeric(factor(model_data$season)) 
+
+holiday_days <- c(ymd("2019-01-01"), ymd("2019-04-21"), ymd("2019-04-22"), ymd("2019-04-27"), ymd("2019-05-30"), ymd("2019-06-09"), ymd("2019-06-10"), ymd("2019-12-25"), ymd("2019-12-26"))
+model_data <- model_data %>%
+  mutate(holiday = Date %in% holiday_days)
+model_data <- model_data %>%
+  mutate(holiday = ifelse(holiday, 1, 0))
+model_data$day_of_week <- as.numeric(format(model_data$Date, "%u"))
+
+model_data$day_night <- ifelse(model_data$avg_start_time >= 6.0 & model_data$avg_start_time <= 18.0, 1, 0)
+
+#avg charging demand at the same plug in hr
+model_data <- model_data %>%
+  group_by(avg_plugin_time) %>%
+  mutate(avg_energy_plugin = mean(daily_total_energy, na.rm = TRUE))
+#avg charging demand at same day of week
+model_data <- model_data %>%
+  group_by(day_of_week) %>%
+  mutate(avg_energy_day = mean(daily_total_energy, na.rm = TRUE))
+#avg charging demand at same start time
+model_data <- model_data %>%
+  group_by(avg_start_time) %>%
+  mutate(avg_energy_start = mean(daily_total_energy, na.rm = TRUE))
+#avg chargind demand at same plug in hr by location
+model_data <- model_data %>%
+  group_by(avg_plugin_time,Location) %>%
+  mutate(avg_energy_plugin_loc = mean(daily_total_energy, na.rm = TRUE))
+#avg charging demand at same day of week by location
+model_data <- model_data %>%
+  group_by(day_of_week,Location) %>%
+  mutate(avg_energy_day_loc = mean(daily_total_energy, na.rm = TRUE))
+#avg charging demand at same start time by loc
+model_data <- model_data %>%
+  group_by(avg_start_time,Location) %>%
+  mutate(avg_energy_start_loc = mean(daily_total_energy, na.rm = TRUE))
+
+loc <- read.csv("worldcities.csv",sep=',')
+loc_NL <- subset(loc, country == "Netherlands")
+loc_selected <- loc_NL[, c("city", "lat", "lng")]
+colnames(loc_selected)[colnames(loc_selected) == "city"] <- "Location"
+model_data <- dplyr::inner_join(model_data, loc_selected, by = "Location")
+
+```
+
+### Stationary test
+
+```{r}
+adf.test(model_data$daily_total_energy, alternative="stationary", k=1)
+acf(sarima_data2$daily_total_energy, main = "")
+pacf(sarima_data2$daily_total_energy, main = "")
+```
+
+```{r}
+ggtsdisplay(model_data$daily_total_energy)
+```
+
+### SARIMAX with all + location
+
+```{r}
+sarimax_train <- subset(model_data, Date < as.Date("2019-10-01"))
+sarimax_test <- subset(model_data, Date >= as.Date("2019-10-01"))
+```
+
+```{r}
+xreg_matrix0 <- as.matrix(sarimax_train[, 5:23])
+fit_sarimax0 <- Arima(sarimax_train[,"daily_total_energy"], xreg = xreg_matrix0, order = c(37,0,34))
+summary(fit_sarimax0)
+```
+
+```{r}
+coef_estimates <- coef(fit_sarimax0)
+coef_se <- sqrt(diag(vcov(fit_sarimax0)))
+t_values <- coef_estimates / coef_se
+n <- length(sarimax_train)  # Number of observations
+k <- length(coef_estimates)  # Number of coefficients
+
+df <- n - k  # Degrees of freedom
+
+t_values <- coef_estimates / coef_se
+p_values <- 2 * (1 - pt(abs(t_values), df = df))
+
+significance <- ifelse(p_values < 0.05, "Significant", "Not significant")
+results <- data.frame(
+  Coefficient = names(coef_estimates),
+  Estimate = coef_estimates,
+  StandardError = coef_se,
+  PValue = p_values,
+  Significance = significance
+)
+```
+
+```{r}
+coeftest(fit_sarimax0)
+```
+
+```{r}
+mean_train <- mean(sarimax_train$daily_total_energy)
+TSS_train <- sum((sarimax_train$daily_total_energy - mean_train)^2)
+RSS_train <- sum((fit_sarimax0$fitted - sarimax_train$daily_total_energy)^2)
+R2_train <- 1 - (RSS_train / TSS_train)
+R2_train
+```
+
+```{r}
+xreg_matrix <- as.matrix(sarimax_train[, 5:23])
+fit_sarimax <- auto.arima(sarimax_train[,"daily_total_energy"], 
+                  xreg = xreg_matrix, seasonal = TRUE, trace = TRUE)
+```
+
+```{r}
+summary(fit_sarimax)
+```
+
+```{r}
+coeftest(fit_sarimax0)
+```
+
+```{r}
+mean_train <- mean(sarimax_train$daily_total_energy)
+TSS_train <- sum((sarimax_train$daily_total_energy - mean_train)^2)
+RSS_train <- sum((fit_sarimax$fitted - sarimax_train$daily_total_energy)^2)
+R2_train <- 1 - (RSS_train / TSS_train)
+R2_train
+```
+
+### Forecast
+
+```{r}
+sarimax_forecast <- forecast(fit_sarimax, h = 92, xreg = as.matrix(sarimax_test[,5:23]))
+sarimax_forecast0 <- forecast(fit_sarimax0, h = 92, xreg = as.matrix(sarimax_test[,5:23]))
+```
+
+```{r}
+autoplot(ts(model_data$daily_total_energy)) + 
+  autolayer(fit_sarimax$fitted, series = "Fit") + 
+  autolayer(sarimax_forecast$mean, series = "Predicted") + 
+  labs(x = "4-hour Interval", y = "Charging Energy")
+autoplot(ts(model_data$daily_total_energy)) + 
+  autolayer(fit_sarimax0$fitted, series = "Fit") + 
+  autolayer(sarimax_forecast0$mean, series = "Predicted") + 
+  labs(x = "4-hour Interval", y = "Charging Energy")
+```
+
+```{r}
+sarimax_pred <- as.vector(sarimax_forecast$mean)
+residuals <- sarimax_test$daily_total_energy - sarimax_pred
+rmse <- sqrt(mean(residuals^2))
+mae <- mean(abs(residuals))
+mape <- mean(abs(residuals / sarimax_test$daily_total_energy)) * 100
+rmse
+mae
+mean_actual <- mean(sarimax_test$daily_total_energy)
+TSS <- sum((sarimax_test$daily_total_energy - mean_actual)^2)
+RSS <- sum((sarimax_pred - sarimax_test$daily_total_energy)^2)
+R2 <- 1 - (RSS / TSS)
+R2
+
+mape <- mean(abs(residuals / sarimax_test$daily_total_energy)) * 100
+mape
+```
+
+```{r}
+sarimax_pred0 <- as.vector(sarimax_forecast0$mean)
+residuals <- sarimax_test$daily_total_energy - sarimax_pred0
+rmse <- sqrt(mean(residuals^2))
+mae <- mean(abs(residuals))
+mape <- mean(abs(residuals / sarimax_test$daily_total_energy)) * 100
+rmse
+mae
+mean_actual <- mean(sarimax_test$daily_total_energy)
+TSS <- sum((sarimax_test$daily_total_energy - mean_actual)^2)
+RSS <- sum((sarimax_pred0 - sarimax_test$daily_total_energy)^2)
+R2 <- 1 - (RSS / TSS)
+R2
+
+mape <- mean(abs(residuals / sarimax_test$daily_total_energy)) * 100
+mape
+```
+
+# XGBoost
+
+## Dataset
+
+```{r}
+# thesis_model <- thesis %>%
+#   group_by(day, Location) %>%
+#   summarise(avg_chargetime = mean(ChargeTime),
+#             daily_total_energy = sum(TotalEnergy),
+#             avg_max_power = mean(MaxPower),
+#             avg_start_time = mean(ChargingHour_start),
+#             avg_idle_time = mean(IdleTime))
+# 
+# #longitude.latitude
+# loc <- read.csv("worldcities.csv",sep=',')
+# loc_NL <- subset(loc, country == "Netherlands")
+# loc_selected <- loc_NL[, c("city", "lat", "lng")]
+# colnames(loc_selected)[colnames(loc_selected) == "city"] <- "Location"
+# thesis_model <- dplyr::inner_join(thesis_model, loc_selected, by = "Location")
+# 
+# thesis_model$month <- month(thesis_model$day)
+# 
+# thesis_model$season <- case_when(
+#   thesis_model$month %in% c("12", "1", "2") ~ "Winter",
+#   thesis_model$month %in% c("3", "4", "5") ~ "Spring",
+#   thesis_model$month %in% c("6", "7", "8") ~ "Summer",
+#   thesis_model$month %in% c("9", "10", "11") ~ "Fall")
+# 
+# holiday_days <- c(ymd("2019-01-01"), ymd("2019-04-21"), ymd("2019-04-22"), ymd("2019-04-27"), ymd("2019-05-30"), ymd("2019-06-09"), ymd("2019-06-10"), ymd("2019-12-25"), ymd("2019-12-26"))
+# thesis_model <- thesis_model %>%
+#   mutate(holiday = day %in% holiday_days)
+# thesis_model <- thesis_model %>%
+#   mutate(holiday = ifelse(holiday, 1, 0))
+# thesis_model$day_of_week <- as.numeric(format(thesis_model$day, "%u"))
+# 
+# #factorize categorical data
+# thesis_model$season <- as.numeric(factor(thesis_model$season))
+thesis_model <- model_data 
+```
+
+```{r}
+# thesis_model <- thesis_model %>%
+#   group_by(Location) %>%
+#   mutate(MA_0 = rollmean(daily_total_energy, k = 1, fill = NA, align = "right"),
+#          MA_0 = ifelse(is.na(MA_0), daily_total_energy, MA_0))
+
+window_sizes <- 1:37
+
+for (i in window_sizes) {
+  ma_column_name <- paste0("MA_", i)
+  thesis_model <- thesis_model %>%
+    group_by(Location) %>%
+    mutate(coalesce_value := coalesce(lag(daily_total_energy, n = 1), daily_total_energy)) %>%
+    mutate(!!ma_column_name := rollmean(coalesce_value, k = i, fill = NA, align = "right"),
+           !!ma_column_name := ifelse(is.na(!!sym(ma_column_name)), coalesce_value, !!sym(ma_column_name))) %>%
+    select(-coalesce_value)
+}
+
+
+```
+
+```{r}
+lags <- 1:34
+for (lag in lags) {
+  ar_column_name <- paste0("AR_", lag)
+  thesis_model <- thesis_model %>%
+    group_by(Location) %>%
+    mutate({{ar_column_name}} := coalesce(lag(daily_total_energy, n = lag), daily_total_energy))
+}
+```
+
+```{r}
+thesis_model <- thesis_model %>%
+  group_by(Location) %>%
+  mutate(diff_1 = coalesce(lag(daily_total_energy, 1) - lag(daily_total_energy, 2), daily_total_energy))
+
+thesis_model <- thesis_model %>%
+  group_by(Location) %>%
+  mutate(diff2 = coalesce(lag(daily_total_energy, 1) - 2 * lag(daily_total_energy, 2) + lag(daily_total_energy, 3), daily_total_energy))
+
+```
+
+```{r}
+#day-night
+thesis_model$day_night <- ifelse(thesis_model$avg_start_time >= 6.0 & thesis_model$avg_start_time <= 18.0, 1, 0)
+#avg charging demand at the same plug in hr
+thesis_model <- thesis_model %>%
+  group_by(avg_plugin_time) %>%
+  mutate(avg_energy_plugin = mean(daily_total_energy, na.rm = TRUE))
+#avg charging demand at same day of week
+thesis_model <- thesis_model %>%
+  group_by(day_of_week) %>%
+  mutate(avg_energy_day = mean(daily_total_energy, na.rm = TRUE))
+#avg charging demand at same start time
+thesis_model <- thesis_model %>%
+  group_by(avg_start_time) %>%
+  mutate(avg_energy_start = mean(daily_total_energy, na.rm = TRUE))
+#avg chargind demand at same plug in hr by location
+thesis_model <- thesis_model %>%
+  group_by(avg_plugin_time,Location) %>%
+  mutate(avg_energy_plugin_loc = mean(daily_total_energy, na.rm = TRUE))
+#avg charging demand at same day of week by location
+thesis_model <- thesis_model %>%
+  group_by(day_of_week,Location) %>%
+  mutate(avg_energy_day_loc = mean(daily_total_energy, na.rm = TRUE))
+#avg charging demand at same start time by loc
+thesis_model <- thesis_model %>%
+  group_by(avg_start_time,Location) %>%
+  mutate(avg_energy_start_loc = mean(daily_total_energy, na.rm = TRUE))
+
+```
+
+```{r}
+thesis_model <- subset(thesis_model, select = -c(Date,Location,Interval))
+```
+
+## Data Split
+
+```{r}
+set.seed(912340)
+thesis_split <- initial_time_split(data = thesis_model, prop = 0.708)
+thesis_train <- training(thesis_split)
+thesis_test <- testing(thesis_split)
+```
+
+## Model with full features
+
+```{r}
+cv_folds <- thesis_train |> vfold_cv(v = 5)
+
+xgb_recipe <- recipe(daily_total_energy ~ ., data = thesis_train) 
+xgb_model_tune <- 
+  boost_tree(trees = tune(), tree_depth = tune(), 
+             learn_rate = tune(), stop_iter = 500) |>
+  set_mode("regression") |>
+  set_engine("xgboost")
+xgb_tune_wf <- workflow() |>
+  add_recipe(xgb_recipe) |>
+  add_model(xgb_model_tune)
+xgb_tune_wf
+
+
+# class_metrics <- metric_set(rmse, mae, mape)
+class_metrics <- yardstick::metric_set(yardstick::rmse, yardstick::mae, 
+                                       yardstick::rsq, yardstick::mape)
+
+registerDoParallel()
+xgb_grid <- expand.grid(trees = 500 * 1:50, 
+                        learn_rate = c(0.1, 0.01), 
+                        tree_depth = 1:3)
+```
+
+```{r}
+xgb_tune_res <- tune_grid(
+  xgb_tune_wf,
+  resamples = cv_folds,
+  grid = xgb_grid,
+  metrics = class_metrics
+)
+
+xgb_tune_metrics <- xgb_tune_res |> collect_metrics()
+```
+
+```{r}
+xgb_tune_metrics
+```
+
+```{r}
+xgb_tune_res |> 
+  collect_metrics() |>
+  dplyr::filter(.metric %in% c("rmse", "mae", "rsq")) |>
+  ggplot(aes(x = trees, y = mean, colour = .metric)) +
+  geom_path() +
+  facet_wrap(learn_rate ~ tree_depth)
+
+
+xgb_tune_metrics |> 
+  dplyr::filter(.metric == "rsq") |> 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "R^2") + 
+  facet_wrap(~ learn_rate)
+
+xgb_tune_metrics |> 
+  dplyr::filter(.metric == "rmse") |> 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "RMSE") + 
+  facet_wrap(~ learn_rate)
+
+xgb_tune_metrics |> 
+  dplyr::filter(.metric == "mae") |> 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "MAE") + 
+  facet_wrap(~ learn_rate)
+
+xgb_tune_metrics |> 
+  dplyr::filter(.metric == "mape") |> 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "MAPE") + 
+  facet_wrap(~ learn_rate)
+```
+
+```{r}
+xgb_tune_metrics |> 
+  dplyr::filter(tree_depth == 3, learn_rate == 0.01, trees >= 100 & trees <= 5000) |> 
+  select(trees:learn_rate, .metric, mean) |>
+  pivot_wider(trees:learn_rate,
+              names_from = .metric,
+              values_from = mean)
+```
+
+```{r}
+xgb_best <- xgb_tune_metrics |> 
+  dplyr::filter(.metric == "rmse", tree_depth == 3, learn_rate == 0.01, trees == 2500)
+xgb_final_wf <- finalize_workflow(xgb_tune_wf, xgb_best)
+xgb_final_wf
+
+xgb_final_fit <- xgb_final_wf |>
+  last_fit(thesis_split, metrics = class_metrics)
+
+xgb_test_results <- xgb_final_fit |>
+  collect_metrics()
+xgb_test_results
+```
+
+```{r}
+xgb_test_results
+```
+
+## Without MA + avg charging D + AR + diff
+
+```{r}
+thesis_model <- model_data 
+```
+
+```{r}
+thesis_model <- subset(thesis_model, select = -c(Date,Interval,Location, avg_energy_plugin,
+                                                 avg_energy_plugin_loc,avg_energy_day,
+                                                 avg_energy_start,avg_energy_day_loc,
+                                                 avg_energy_start_loc))
+```
+
+```{r}
+set.seed(912340)
+thesis_split <- initial_time_split(data = thesis_model, prop = 0.708)
+thesis_train <- training(thesis_split)
+thesis_test <- testing(thesis_split)
+```
+
+```{r}
+cv_folds <- thesis_train |> vfold_cv(v = 5)
+
+xgb_recipe <- recipe(daily_total_energy ~ ., data = thesis_train) 
+xgb_model_tune <- 
+  boost_tree(trees = tune(), tree_depth = tune(), 
+             learn_rate = tune(), stop_iter = 500) |>
+  set_mode("regression") |>
+  set_engine("xgboost")
+xgb_tune_wf <- workflow() |>
+  add_recipe(xgb_recipe) |>
+  add_model(xgb_model_tune)
+xgb_tune_wf
+
+
+# class_metrics <- metric_set(rmse, mae, mape)
+class_metrics <- yardstick::metric_set(yardstick::rmse, yardstick::mae, 
+                                       yardstick::rsq, yardstick::mape)
+
+registerDoParallel()
+xgb_grid <- expand.grid(trees = 500 * 1:20, 
+                        learn_rate = c(0.1, 0.01), 
+                        tree_depth = 1:5)
+```
+
+```{r}
+xgb_tune_res <- tune_grid(
+  xgb_tune_wf,
+  resamples = cv_folds,
+  grid = xgb_grid,
+  metrics = class_metrics
+)
+
+xgb_tune_metrics <- xgb_tune_res |> collect_metrics()
+```
+
+```{r}
+xgb_tune_metrics
+```
+
+```{r}
+xgb_tune_res |> 
+  collect_metrics() |>
+  dplyr::filter(.metric %in% c("rmse", "mae", "rsq")) |>
+  ggplot(aes(x = trees, y = mean, colour = .metric)) +
+  geom_path() +
+  facet_wrap(learn_rate ~ tree_depth)
+
+
+xgb_tune_metrics |> 
+  dplyr::filter(.metric == "rsq") |> 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "R^2") + 
+  facet_wrap(~ learn_rate)
+
+xgb_tune_metrics |> 
+  dplyr::filter(.metric == "rmse") |> 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "RMSE") + 
+  facet_wrap(~ learn_rate)
+
+xgb_tune_metrics |> 
+  dplyr::filter(.metric == "mae") |> 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "MAE") + 
+  facet_wrap(~ learn_rate)
+
+xgb_tune_metrics |> 
+  dplyr::filter(.metric == "mape") |> 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "MAPE") + 
+  facet_wrap(~ learn_rate)
+```
+
+```{r}
+xgb_tune_metrics |> 
+  dplyr::filter(tree_depth == 3, learn_rate == 0.01, trees >= 5000 & trees <= 8000) |> 
+  select(trees:learn_rate, .metric, mean) |>
+  pivot_wider(trees:learn_rate,
+              names_from = .metric,
+              values_from = mean)
+```
+
+```{r}
+xgb_best <- xgb_tune_metrics |> 
+  dplyr::filter(.metric == "rmse", tree_depth == 3, learn_rate == 0.01, trees == 6500)
+xgb_final_wf <- finalize_workflow(xgb_tune_wf, xgb_best)
+xgb_final_wf
+
+xgb_final_fit <- xgb_final_wf |>
+  last_fit(thesis_split, metrics = class_metrics)
+
+xgb_test_results <- xgb_final_fit |>
+  collect_metrics()
+xgb_test_results
+```
+
+```{r}
+xgb_test_results
+```
+
+## With diff
+
+```{r}
+thesis_model <- model_data 
+```
+
+```{r}
+thesis_model <- thesis_model %>%
+  group_by(Location) %>%
+  mutate(diff_1 = coalesce(lag(daily_total_energy, 1) - lag(daily_total_energy, 2), daily_total_energy))
+
+thesis_model <- thesis_model %>%
+  group_by(Location) %>%
+  mutate(diff2 = coalesce(lag(daily_total_energy, 1) - 2 * lag(daily_total_energy, 2) + lag(daily_total_energy, 3), daily_total_energy))
+```
+
+```{r}
+thesis_model <- subset(thesis_model, select = -c(Date,Interval,Location, avg_energy_plugin,
+                                                 avg_energy_plugin_loc,avg_energy_day,
+                                                 avg_energy_start,avg_energy_day_loc,
+                                                 avg_energy_start_loc))
+```
+
+```{r}
+set.seed(912340)
+thesis_split <- initial_time_split(data = thesis_model, prop = 0.708)
+thesis_train <- training(thesis_split)
+thesis_test <- testing(thesis_split)
+```
+
+```{r}
+cv_folds <- thesis_train |> vfold_cv(v = 5)
+
+xgb_recipe <- recipe(daily_total_energy ~ ., data = thesis_train) 
+xgb_model_tune <- 
+  boost_tree(trees = tune(), tree_depth = tune(), 
+             learn_rate = tune(), stop_iter = 500) |>
+  set_mode("regression") |>
+  set_engine("xgboost")
+xgb_tune_wf <- workflow() |>
+  add_recipe(xgb_recipe) |>
+  add_model(xgb_model_tune)
+xgb_tune_wf
+
+
+# class_metrics <- metric_set(rmse, mae, mape)
+class_metrics <- yardstick::metric_set(yardstick::rmse, yardstick::mae, 
+                                       yardstick::rsq, yardstick::mape)
+
+registerDoParallel()
+xgb_grid <- expand.grid(trees = 500 * 1:50, 
+                        learn_rate = c(0.1, 0.01), 
+                        tree_depth = 1:3)
+```
+
+```{r}
+xgb_tune_res <- tune_grid(
+  xgb_tune_wf,
+  resamples = cv_folds,
+  grid = xgb_grid,
+  metrics = class_metrics
+)
+
+xgb_tune_metrics <- xgb_tune_res |> collect_metrics()
+```
+
+```{r}
+xgb_tune_metrics
+```
+
+```{r}
+xgb_tune_metrics |> 
+  dplyr::filter(.metric == "rsq") |> 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "R^2") + 
+  facet_wrap(~ learn_rate)
+
+xgb_tune_metrics |> 
+  dplyr::filter(.metric == "rmse") |> 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "RMSE") + 
+  facet_wrap(~ learn_rate)
+
+xgb_tune_metrics |> 
+  dplyr::filter(.metric == "mae") |> 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "MAE") + 
+  facet_wrap(~ learn_rate)
+
+xgb_tune_metrics |> 
+  dplyr::filter(.metric == "mape") |> 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "MAPE") + 
+  facet_wrap(~ learn_rate)
+```
+
+```{r}
+xgb_tune_metrics |> 
+  dplyr::filter(tree_depth == 3, learn_rate == 0.01, trees >= 500 & trees <= 10000) |> 
+  select(trees:learn_rate, .metric, mean) |>
+  pivot_wider(trees:learn_rate,
+              names_from = .metric,
+              values_from = mean)
+```
+
+```{r}
+xgb_best <- xgb_tune_metrics |> 
+  dplyr::filter(.metric == "rmse", tree_depth == 3, learn_rate == 0.01, trees == 7500)
+xgb_final_wf <- finalize_workflow(xgb_tune_wf, xgb_best)
+xgb_final_wf
+
+xgb_final_fit <- xgb_final_wf |>
+  last_fit(thesis_split, metrics = class_metrics)
+
+xgb_test_results <- xgb_final_fit |>
+  collect_metrics()
+```
+
+```{r}
+xgb_test_results
+```
+
+## With diff + AR
+
+```{r}
+thesis_model <- model_data 
+```
+
+```{r}
+thesis_model <- thesis_model %>%
+  group_by(Location) %>%
+  mutate(diff_1 = coalesce(lag(daily_total_energy, 1) - lag(daily_total_energy, 2), daily_total_energy))
+
+thesis_model <- thesis_model %>%
+  group_by(Location) %>%
+  mutate(diff2 = coalesce(lag(daily_total_energy, 1) - 2 * lag(daily_total_energy, 2) + lag(daily_total_energy, 3), daily_total_energy))
+```
+
+```{r}
+lags <- 1:34
+for (lag in lags) {
+  ar_column_name <- paste0("AR_", lag)
+  thesis_model <- thesis_model %>%
+    group_by(Location) %>%
+    mutate({{ar_column_name}} := coalesce(lag(daily_total_energy, n = lag), daily_total_energy))
+}
+```
+
+```{r}
+thesis_model <- subset(thesis_model, select = -c(Date,Interval,Location, avg_energy_plugin,
+                                                 avg_energy_plugin_loc,avg_energy_day,
+                                                 avg_energy_start,avg_energy_day_loc,
+                                                 avg_energy_start_loc))
+```
+
+```{r}
+set.seed(912340)
+thesis_split <- initial_time_split(data = thesis_model, prop = 0.708)
+thesis_train <- training(thesis_split)
+thesis_test <- testing(thesis_split)
+```
+
+```{r}
+cv_folds <- thesis_train |> vfold_cv(v = 5)
+
+xgb_recipe <- recipe(daily_total_energy ~ ., data = thesis_train) 
+xgb_model_tune <- 
+  boost_tree(trees = tune(), tree_depth = tune(), 
+             learn_rate = tune(), stop_iter = 500) |>
+  set_mode("regression") |>
+  set_engine("xgboost")
+xgb_tune_wf <- workflow() |>
+  add_recipe(xgb_recipe) |>
+  add_model(xgb_model_tune)
+xgb_tune_wf
+
+
+# class_metrics <- metric_set(rmse, mae, mape)
+class_metrics <- yardstick::metric_set(yardstick::rmse, yardstick::mae, 
+                                       yardstick::rsq, yardstick::mape)
+
+registerDoParallel()
+xgb_grid <- expand.grid(trees = 500 * 1:50, 
+                        learn_rate = c(0.1, 0.01), 
+                        tree_depth = 1:3)
+```
+
+```{r}
+xgb_tune_res <- tune_grid(
+  xgb_tune_wf,
+  resamples = cv_folds,
+  grid = xgb_grid,
+  metrics = class_metrics
+)
+
+xgb_tune_metrics <- xgb_tune_res |> collect_metrics()
+```
+
+```{r}
+xgb_tune_metrics
+```
+
+```{r}
+xgb_tune_metrics |> 
+  dplyr::filter(.metric == "rsq") |> 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "R^2") + 
+  facet_wrap(~ learn_rate)
+
+xgb_tune_metrics |> 
+  dplyr::filter(.metric == "rmse") |> 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "RMSE") + 
+  facet_wrap(~ learn_rate)
+
+xgb_tune_metrics |> 
+  dplyr::filter(.metric == "mae") |> 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "MAE") + 
+  facet_wrap(~ learn_rate)
+
+xgb_tune_metrics |> 
+  dplyr::filter(.metric == "mape") |> 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "MAPE") + 
+  facet_wrap(~ learn_rate)
+```
+
+```{r}
+xgb_tune_metrics |> 
+  dplyr::filter(tree_depth == 3, learn_rate == 0.01, trees >= 500 & trees <= 20000) |> 
+  select(trees:learn_rate, .metric, mean) |>
+  pivot_wider(trees:learn_rate,
+              names_from = .metric,
+              values_from = mean)
+```
+
+```{r}
+xgb_best <- xgb_tune_metrics |> 
+  dplyr::filter(.metric == "rmse", tree_depth == 3, learn_rate == 0.01, trees == 1000)
+xgb_final_wf <- finalize_workflow(xgb_tune_wf, xgb_best)
+xgb_final_wf
+
+xgb_final_fit <- xgb_final_wf |>
+  last_fit(thesis_split, metrics = class_metrics)
+
+xgb_test_results <- xgb_final_fit |>
+  collect_metrics()
+xgb_test_results
+```
+
+## With diff + AR + MA
+
+```{r}
+thesis_model <- model_data 
+```
+
+```{r}
+thesis_model <- thesis_model %>%
+  group_by(Location) %>%
+  mutate(diff_1 = coalesce(lag(daily_total_energy, 1) - lag(daily_total_energy, 2), daily_total_energy))
+
+thesis_model <- thesis_model %>%
+  group_by(Location) %>%
+  mutate(diff2 = coalesce(lag(daily_total_energy, 1) - 2 * lag(daily_total_energy, 2) + lag(daily_total_energy, 3), daily_total_energy))
+```
+
+```{r}
+lags <- 1:34
+for (lag in lags) {
+  ar_column_name <- paste0("AR_", lag)
+  thesis_model <- thesis_model %>%
+    group_by(Location) %>%
+    mutate({{ar_column_name}} := coalesce(lag(daily_total_energy, n = lag), daily_total_energy))
+}
+```
+
+```{r}
+window_sizes <- 1:37
+
+for (i in window_sizes) {
+  ma_column_name <- paste0("MA_", i)
+  thesis_model <- thesis_model %>%
+    group_by(Location) %>%
+    mutate(coalesce_value := coalesce(lag(daily_total_energy, n = 1), daily_total_energy)) %>%
+    mutate(!!ma_column_name := rollmean(coalesce_value, k = i, fill = NA, align = "right"),
+           !!ma_column_name := ifelse(is.na(!!sym(ma_column_name)), coalesce_value, !!sym(ma_column_name))) %>%
+    select(-coalesce_value)
+}
+
+```
+
+```{r}
+thesis_model <- subset(thesis_model, select = -c(Date,Interval,Location, avg_energy_plugin,
+                                                 avg_energy_plugin_loc,avg_energy_day,
+                                                 avg_energy_start,avg_energy_day_loc,
+                                                 avg_energy_start_loc))
+```
+
+```{r}
+set.seed(912340)
+thesis_split <- initial_time_split(data = thesis_model, prop = 0.708)
+thesis_train <- training(thesis_split)
+thesis_test <- testing(thesis_split)
+```
+
+```{r}
+cv_folds <- thesis_train |> vfold_cv(v = 5)
+
+xgb_recipe <- recipe(daily_total_energy ~ ., data = thesis_train) 
+xgb_model_tune <- 
+  boost_tree(trees = tune(), tree_depth = tune(), 
+             learn_rate = tune(), stop_iter = 500) |>
+  set_mode("regression") |>
+  set_engine("xgboost")
+xgb_tune_wf <- workflow() |>
+  add_recipe(xgb_recipe) |>
+  add_model(xgb_model_tune)
+xgb_tune_wf
+
+
+# class_metrics <- metric_set(rmse, mae, mape)
+class_metrics <- yardstick::metric_set(yardstick::rmse, yardstick::mae, 
+                                       yardstick::rsq, yardstick::mape)
+
+registerDoParallel()
+xgb_grid <- expand.grid(trees = 500 * 1:50, 
+                        learn_rate = c(0.1, 0.01), 
+                        tree_depth = 1:3)
+```
+
+```{r}
+xgb_tune_res <- tune_grid(
+  xgb_tune_wf,
+  resamples = cv_folds,
+  grid = xgb_grid,
+  metrics = class_metrics
+)
+
+xgb_tune_metrics <- xgb_tune_res |> collect_metrics()
+```
+
+```{r}
+xgb_tune_metrics
+```
+
+```{r}
+xgb_tune_metrics |> 
+  dplyr::filter(.metric == "rsq") |> 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "R^2") + 
+  facet_wrap(~ learn_rate)
+
+xgb_tune_metrics |> 
+  dplyr::filter(.metric == "rmse") |> 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "RMSE") + 
+  facet_wrap(~ learn_rate)
+
+xgb_tune_metrics |> 
+  dplyr::filter(.metric == "mae") |> 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "MAE") + 
+  facet_wrap(~ learn_rate)
+
+xgb_tune_metrics |> 
+  dplyr::filter(.metric == "mape") |> 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "MAPE") + 
+  facet_wrap(~ learn_rate)
+```
+
+```{r}
+xgb_tune_metrics |> 
+  dplyr::filter(tree_depth == 3, learn_rate == 0.01, trees >= 100 & trees <= 10000) |> 
+  select(trees:learn_rate, .metric, mean) |>
+  pivot_wider(trees:learn_rate,
+              names_from = .metric,
+              values_from = mean)
+```
+
+```{r}
+xgb_best <- xgb_tune_metrics |> 
+  dplyr::filter(.metric == "rmse", tree_depth == 3, learn_rate == 0.01, trees == 1500)
+xgb_final_wf <- finalize_workflow(xgb_tune_wf, xgb_best)
+xgb_final_wf
+
+xgb_final_fit <- xgb_final_wf |>
+  last_fit(thesis_split, metrics = class_metrics)
+
+xgb_test_results <- xgb_final_fit |>
+  collect_metrics()
+xgb_test_results
+```
+
+## Compare accuracy score
+
+```{r}
+library(ggplot2)
+
+data <- data.frame(
+  Model = c("Model without historical demand", "Model with order differencing", "Model with order differencing + AR", "Model with order differencing + AR + MA", "Model with full features"),
+  RMSE = c(13.5751345, 13.5085574, 12.3943060, 10.7674321, 11.4179343),
+  MAE = c(8.0423102, 7.9948953, 7.8611884, 7.2346913, 7.1766478),
+  MAPE = c(37.1667552, 34.8165957, 32.7227883, 30.1798613, 31.6535089),
+  R2 = c(0.7227917, 0.7389165, 0.7889788, 0.8076548, 0.8029626)
+)
+
+# Wrap the model text at a width of 20 characters
+data$Model <- stringr::str_wrap(data$Model, width = 20)
+
+# Define the order of the levels based on the original order in the dataset
+model_order <- data$Model
+
+# Convert the Model column to a factor with the desired order
+data$Model <- factor(data$Model, levels = model_order)
+
+# Reshape the data from wide to long format
+data_long <- tidyr::pivot_longer(data, cols = c(RMSE, MAE, MAPE, R2), names_to = "Metric", values_to = "Value")
+
+# Create the line graph
+ggplot(data_long, aes(x = Model, y = Value, group = Metric, color = Metric)) +
+  geom_line() +
+  geom_point(size = 1) +
+  labs(
+       x = "Model",
+       y = "Value") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+# Variable Importance
+
+```{r}
+labels <- thesis_train$daily_total_energy
+train_matrix <- as.matrix(thesis_train[, !(colnames(thesis_train) %in% "daily_total_energy")])
+
+model_xgboost <- xgboost(data = train_matrix, label = labels, 
+                         tree_depth = 3, nrounds  = 1500, learn_rate = 0.01)
+
+importance_matrix = xgb.importance(colnames(xgb_train), model = model_xgboost)
+
+importance_matrix
+xgb.plot.importance(importance_matrix[1:10,])
+xgb.plot.importance(importance_matrix[76:86,])
+xgb.plot.importance(importance_matrix[11:86,])
+```
+
+# Partial dependence
+
+```{r}
+xgb_spec <- boost_tree(
+  trees = 3500,
+  tree_depth = 1,
+  learn_rate = 0.1,
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression") %>% 
+  fit(daily_total_energy ~ ., data = thesis_train)
+
+```
+
+```{r}
+pdp::partial(
+  xgb_spec$fit,
+  pred.var = "diff_1",
+  ice = T,
+  center = T,
+  plot = T,
+  alpha = .1,
+  plot.engine = "ggplot2",
+  train = thesis_train %>% select(-daily_total_energy)
+)
+pdp::partial(
+  xgb_spec$fit,
+  pred.var = "avg_chargetime",
+  ice = T,
+  center = T,
+  plot = T,
+  alpha = .1,
+  plot.engine = "ggplot2",
+  train = thesis_train %>% select(-daily_total_energy)
+)
+pdp::partial(
+  xgb_spec$fit,
+  pred.var = "AR_1",
+  ice = T,
+  center = T,
+  plot = T,
+  alpha = .1,
+  plot.engine = "ggplot2",
+  train = thesis_train %>% select(-daily_total_energy)
+)
+```
+
+```{r}
+xgb_spec <- boost_tree(
+  trees = 24500,
+  tree_depth = 1,
+  learn_rate = 0.1,
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression") %>% 
+  fit(daily_total_energy ~ ., data = thesis_train)
+```
+
+```{r}
+pdp::partial(
+  xgb_spec$fit,
+  pred.var = "MA_2",
+  ice = T,
+  center = T,
+  plot = T,
+  alpha = .1,
+  plot.engine = "ggplot2",
+  train = thesis_train %>% select(-daily_total_energy)
+)
+pdp::partial(
+  xgb_spec$fit,
+  pred.var = "avg_max_power",
+  ice = T,
+  center = T,
+  plot = T,
+  alpha = .1,
+  plot.engine = "ggplot2",
+  train = thesis_train %>% select(-daily_total_energy)
+)
+pdp::partial(
+  xgb_spec$fit,
+  pred.var = "avg_energy_start",
+  ice = T,
+  center = T,
+  plot = T,
+  alpha = .1,
+  plot.engine = "ggplot2",
+  train = thesis_train %>% select(-daily_total_energy)
+)
+```
+
+```{r}
+
+```
